@@ -1,6 +1,14 @@
 """
 parser.py — Advanced resume parser with multi-strategy extraction,
             confidence scoring, and structured work history detection.
+
+FIXES:
+  - Bug 1: Education field no longer false-matches skills/words like "Python"
+            Now restricted to education section only and uses stricter patterns.
+  - Bug 2: Work history company/title extraction was reversed and truncated.
+            Now correctly parses "Title – Company (year)" format.
+  - Bug 3: Duplicate certifications from overlapping regex patterns.
+            Now deduplicates by normalising cert text before adding to set.
 """
 
 from __future__ import annotations
@@ -63,49 +71,53 @@ SKILL_TAXONOMY: Dict[str, List[str]] = {
     ],
 }
 
-# Flattened set for fast lookup
+# Flattened list for fast lookup
 ALL_SKILLS: List[str] = [s for group in SKILL_TAXONOMY.values() for s in group]
 
 # Section header patterns
 SECTION_PATTERNS = {
     "summary": re.compile(
         r"^(?:summary|profile|about|objective|overview|professional\s+summary)[:\s]*$",
-        re.IGNORECASE | re.MULTILINE
+        re.IGNORECASE | re.MULTILINE,
     ),
     "skills": re.compile(
         r"^(?:skills?|technical\s+skills?|core\s+competencies|technologies)[:\s]*$",
-        re.IGNORECASE | re.MULTILINE
+        re.IGNORECASE | re.MULTILINE,
     ),
     "experience": re.compile(
         r"^(?:experience|work\s+experience|employment|work\s+history|professional\s+experience)[:\s]*$",
-        re.IGNORECASE | re.MULTILINE
+        re.IGNORECASE | re.MULTILINE,
     ),
     "education": re.compile(
         r"^(?:education|academic|qualifications)[:\s]*$",
-        re.IGNORECASE | re.MULTILINE
+        re.IGNORECASE | re.MULTILINE,
     ),
     "certifications": re.compile(
         r"^(?:certifications?|certificates?|licenses?|courses?)[:\s]*$",
-        re.IGNORECASE | re.MULTILINE
+        re.IGNORECASE | re.MULTILINE,
     ),
 }
+
+# ── FIX BUG 3: Known cert prefixes for deduplication ──────────────
+# Maps a normalised key → canonical full name so overlapping patterns
+# (e.g. "AWS Certified Solutions Architect" and "Certified Solutions Architect")
+# collapse into one entry.
+def _cert_key(cert: str) -> str:
+    """Normalise a cert string to a deduplication key."""
+    return re.sub(r"\s+", " ", cert.lower().strip())
 
 
 class ResumeParser:
     """
     Advanced resume parser using multi-strategy NLP-style extraction.
 
-    Strategies used (in priority order):
-      1. Section-aware parsing — locate named sections first
-      2. Pattern matching — regex for emails, phones, dates, URLs
-      3. Heuristic scoring — estimate parse confidence
+    Strategies (priority order):
+      1. Section-aware parsing  — locate named sections first
+      2. Pattern matching       — regex for emails, phones, dates, URLs
+      3. Heuristic scoring      — estimate parse confidence
     """
 
     def __init__(self, custom_skills: Optional[List[str]] = None):
-        """
-        Args:
-            custom_skills: Extra skills to add to the taxonomy.
-        """
         self._skills = ALL_SKILLS.copy()
         if custom_skills:
             self._skills.extend([s.lower().strip() for s in custom_skills])
@@ -117,12 +129,6 @@ class ResumeParser:
     def parse(self, text: str) -> Candidate:
         """
         Parse raw resume text into a structured Candidate.
-
-        Args:
-            text: Raw resume string (plain text).
-
-        Returns:
-            Candidate: Populated profile.
 
         Raises:
             ValueError: If text is empty or too short to parse.
@@ -136,21 +142,24 @@ class ResumeParser:
         candidate = Candidate()
         candidate.raw_text = text
 
-        candidate.name         = self._extract_name(text)
-        candidate.email        = self._extract_email(text)
-        candidate.phone        = self._extract_phone(text)
-        candidate.linkedin     = self._extract_linkedin(text)
-        candidate.github       = self._extract_github(text)
-        candidate.location     = self._extract_location(text)
-        candidate.skills       = self._extract_skills(text, sections)
-        candidate.work_history = self._extract_work_history(
-            sections.get("experience", text)
-        )
+        candidate.name             = self._extract_name(text)
+        candidate.email            = self._extract_email(text)
+        candidate.phone            = self._extract_phone(text)
+        candidate.linkedin         = self._extract_linkedin(text)
+        candidate.github           = self._extract_github(text)
+        candidate.location         = self._extract_location(text)
+        candidate.skills           = self._extract_skills(text, sections)
+        candidate.work_history     = self._extract_work_history(
+                                         sections.get("experience", text)
+                                     )
         candidate.experience_years = self._calculate_total_experience(
-            candidate.work_history, text
-        )
+                                         candidate.work_history, text
+                                     )
         candidate.education        = self._extract_education_level(text)
-        candidate.education_field  = self._extract_education_field(text)
+        # BUG 1 FIX: pass education section only, not full text
+        candidate.education_field  = self._extract_education_field(
+                                         sections.get("education", "")
+                                     )
         candidate.certifications   = self._extract_certifications(text, sections)
         candidate.languages        = self._extract_languages(text)
         candidate.summary          = self._extract_summary(text, sections)
@@ -158,7 +167,7 @@ class ResumeParser:
 
         logger.info(
             "Parsed candidate '%s' — confidence %.0f%%",
-            candidate.name, candidate.parse_confidence * 100
+            candidate.name, candidate.parse_confidence * 100,
         )
         return candidate
 
@@ -175,7 +184,6 @@ class ResumeParser:
     # ──────────────────────────────────────────────────
 
     def _normalize(self, text: str) -> str:
-        """Clean up whitespace and encoding artifacts."""
         text = re.sub(r"\r\n|\r", "\n", text)
         text = re.sub(r"\t", "  ", text)
         text = re.sub(r" {3,}", "  ", text)
@@ -183,10 +191,7 @@ class ResumeParser:
         return text.strip()
 
     def _split_sections(self, text: str) -> Dict[str, str]:
-        """
-        Identify and split resume into named sections.
-        Returns dict: section_name → section_content.
-        """
+        """Split resume into named sections."""
         sections: Dict[str, str] = {}
         lines = text.splitlines()
         current_section = "header"
@@ -198,7 +203,6 @@ class ResumeParser:
                 if pattern.match(line.strip()):
                     matched_section = name
                     break
-
             if matched_section:
                 sections[current_section] = "\n".join(current_lines)
                 current_section = matched_section
@@ -210,15 +214,12 @@ class ResumeParser:
         return sections
 
     def _extract_name(self, text: str) -> str:
-        """Extract candidate name from the header region."""
         lines = [l.strip() for l in text.splitlines()[:8] if l.strip()]
         for line in lines:
-            # Skip lines with contact info markers
             if re.search(r"[@|•\d()\[\]/\\]", line):
                 continue
             words = line.split()
             if 2 <= len(words) <= 4 and all(w[0].isupper() for w in words if w):
-                # Filter common header labels
                 if not re.match(r"(?:resume|curriculum|vitae|cv|profile)", line, re.IGNORECASE):
                     return line
         return "Unknown"
@@ -229,10 +230,10 @@ class ResumeParser:
 
     def _extract_phone(self, text: str) -> str:
         patterns = [
-            r"\+\d{1,3}[\s\-]?\d{3,4}[\s\-]?\d{4}",            # +1-555-0101
-            r"\+?1?[\s\-.]?\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}",  # (555) 010-1234
-            r"\b\d{3}[\s\-]\d{3}[\s\-]\d{4}\b",                  # 555-010-1234
-            r"\b\d{10}\b",                                        # 5550101234
+            r"\+\d{1,3}[\s\-]?\d{3,4}[\s\-]?\d{4}",
+            r"\+?1?[\s\-.]?\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}",
+            r"\b\d{3}[\s\-]\d{3}[\s\-]\d{4}\b",
+            r"\b\d{10}\b",
         ]
         for p in patterns:
             for m in re.finditer(p, text):
@@ -250,30 +251,22 @@ class ResumeParser:
         return f"https://www.{m.group(0)}" if m else ""
 
     def _extract_location(self, text: str) -> str:
-        """Extract city/country from header lines."""
         lines = [l.strip() for l in text.splitlines()[:10] if l.strip()]
         for line in lines:
-            # Looks like "New York, NY" or "Bangalore, India"
             if re.match(r"^[A-Z][a-zA-Z\s]+,\s*[A-Z][a-zA-Z\s]+$", line):
                 return line
         return ""
 
     def _extract_skills(self, text: str, sections: Dict[str, str]) -> List[str]:
-        """
-        Extract skills using both keyword matching and section-aware parsing.
-        Section-specific text is searched first to boost confidence.
-        """
         text_lower = text.lower()
         section_text = sections.get("skills", "").lower()
         found = set()
 
         for skill in self._skills:
             pattern = r"\b" + re.escape(skill) + r"\b"
-            # Extra weight to explicit skills sections, but search full text too
             if re.search(pattern, text_lower):
                 found.add(skill)
 
-        # Also capture comma/bullet-separated skills from the skills section
         if section_text:
             tokens = re.split(r"[,•\|\n/]+", section_text)
             for token in tokens:
@@ -285,16 +278,20 @@ class ResumeParser:
 
         return sorted(found)
 
+    # ── BUG 2 FIX: Work history extraction ────────────────────────────
     def _extract_work_history(self, experience_text: str) -> List[WorkExperience]:
-        """Parse individual work entries from experience section."""
-        entries: List[WorkExperience] = []
-        current_year = datetime.now().year
+        """
+        Parse individual work entries from experience section.
 
-        # Split into blocks by date patterns
-        blocks = re.split(
-            r"\n(?=[A-Z][^\n]{5,60}\n|[A-Z][^\n]{5,60}\s+\d{4})",
-            experience_text
-        )
+        Handles the common resume format:
+            Job Title – Company Name (YYYY – YYYY/Present)
+              Description bullet...
+        """
+        entries: List[WorkExperience] = []
+
+        # Split on lines that look like a new job entry header:
+        # capital-letter line that contains a year pattern
+        blocks = re.split(r"\n(?=[A-Z][^\n]{5,80}(?:\(|\d{4}))", experience_text)
 
         for block in blocks:
             if not block.strip():
@@ -303,7 +300,7 @@ class ResumeParser:
             # Extract year range
             year_match = re.search(
                 r"(\d{4})\s*[-–—]\s*(\d{4}|[Pp]resent|[Cc]urrent|[Nn]ow)",
-                block
+                block,
             )
             if not year_match:
                 continue
@@ -312,143 +309,187 @@ class ResumeParser:
             end_raw = year_match.group(2).lower()
             end_year = None if end_raw in ("present", "current", "now") else int(end_raw)
 
-            # Extract company name (usually first capitalised line)
-            lines = [l.strip() for l in block.splitlines() if l.strip()]
-            company = ""
-            title = ""
-            for line in lines[:3]:
-                line_clean = re.sub(r"\d{4}.*", "", line).strip()
-                if not line_clean:
-                    continue
-                if not company:
-                    company = line_clean
-                elif not title:
-                    title = line_clean
-                else:
-                    break
+            # ── Extract title and company from the first line ──────────
+            # Common pattern: "Job Title – Company Name (2020 – Present)"
+            #                 "Job Title at Company Name (2020 – Present)"
+            first_line = block.splitlines()[0].strip()
 
-            description = " ".join(
-                l.strip() for l in lines[3:8] if l.strip()
-            )
+            # Remove the date part from the first line for cleaner parsing
+            header = re.sub(r"\s*\(?\d{4}\s*[-–—].*", "", first_line).strip()
+
+            title = ""
+            company = ""
+
+            # Try "Title – Company" or "Title — Company" separator
+            sep_match = re.split(r"\s+[-–—]\s+", header, maxsplit=1)
+            if len(sep_match) == 2:
+                title   = sep_match[0].strip()
+                company = sep_match[1].strip()
+            else:
+                # Try "Title at Company"
+                at_match = re.split(r"\s+at\s+", header, maxsplit=1, flags=re.IGNORECASE)
+                if len(at_match) == 2:
+                    title   = at_match[0].strip()
+                    company = at_match[1].strip()
+                else:
+                    # Fallback: whole header is the title
+                    title = header
+
+            # Description = remaining lines (skip header line)
+            desc_lines = [l.strip() for l in block.splitlines()[1:] if l.strip()]
+            description = " ".join(desc_lines[:4])[:300]
 
             if start_year >= 1970:
                 entries.append(WorkExperience(
-                    company=company,
                     title=title,
+                    company=company,
                     start_year=start_year,
                     end_year=end_year,
-                    description=description[:300],
+                    description=description,
                 ))
 
-        # Sort most recent first
         entries.sort(key=lambda e: e.start_year, reverse=True)
         return entries
 
     def _calculate_total_experience(
         self, work_history: List[WorkExperience], text: str
     ) -> float:
-        """
-        Calculate total years of experience.
-        Uses work history timeline first, falls back to explicit mentions.
-        """
         if work_history:
-            # Sum non-overlapping durations (simplified: take the span of career)
             years = [w.start_year for w in work_history]
             if years:
                 earliest = min(years)
                 return round(min(datetime.now().year - earliest, 40), 1)
 
-        # Fallback: explicit mention
-        direct = re.findall(r"(\d+)\+?\s*years?\s*(?:of\s*)?(?:experience|exp)", text, re.IGNORECASE)
+        direct = re.findall(
+            r"(\d+)\+?\s*years?\s*(?:of\s*)?(?:experience|exp)", text, re.IGNORECASE
+        )
         if direct:
             return float(max(int(y) for y in direct))
 
         return 0.0
 
     def _extract_education_level(self, text: str) -> EducationLevel:
-        """Return highest detected education level."""
         return EducationLevel.from_string(text)
 
-    def _extract_education_field(self, text: str) -> str:
-        """Extract field of study (e.g., 'Computer Science')."""
+    # ── BUG 1 FIX: Education field extraction ─────────────────────────
+    def _extract_education_field(self, education_section: str) -> str:
+        """
+        Extract field of study from the education section only.
+        Previously received the full resume text, causing false matches
+        like 'Python' (from the skills section) being returned.
+
+        Restricted patterns only match degree-like phrases:
+            'Bachelor of Science in Computer Science'
+            'M.Sc in Software Engineering'
+        """
+        if not education_section.strip():
+            return ""
+
+        # Only look at the education section, not the full resume
         patterns = [
-            r"(?:in|of)\s+([A-Z][a-zA-Z\s]{3,40}?)(?:,|\.|from|\d)",
-            r"B\.?(?:Sc|Tech|E)\.?\s+(?:in\s+)?([A-Z][a-zA-Z\s]{3,30})",
-            r"M\.?(?:Sc|Tech|BA|S)\.?\s+(?:in\s+)?([A-Z][a-zA-Z\s]{3,30})",
+            # "Bachelor/Master of X in Y" → capture Y
+            r"(?:Bachelor|Master|B\.?Sc|M\.?Sc|B\.?Tech|M\.?Tech|B\.?E|M\.?E)"
+            r"[^\n]{0,30}\bin\s+([A-Z][a-zA-Z\s]{3,40}?)(?:\s*[-–,]|\s*\d{4}|\s*$)",
+            # "Degree in Y from/at University"
+            r"\bin\s+([A-Z][a-zA-Z\s]{3,40}?)(?:\s+(?:from|at|–|-)\s+[A-Z])",
         ]
+
         for p in patterns:
-            m = re.search(p, text)
+            m = re.search(p, education_section)
             if m:
-                return m.group(1).strip()
+                field = m.group(1).strip()
+                # Sanity-check: reject if it looks like a skill or university name
+                skip_words = {
+                    "python", "java", "state", "tech", "university",
+                    "college", "institute", "the", "and", "of",
+                }
+                if field.lower() not in skip_words and len(field) > 3:
+                    return field
         return ""
 
+    # ── BUG 3 FIX: Certification deduplication ────────────────────────
     def _extract_certifications(self, text: str, sections: Dict[str, str]) -> List[str]:
-        """Extract certification names."""
+        """
+        Extract certification names, deduplicating overlapping matches.
+
+        Root cause of duplicates: overlapping patterns like 'Certified ...'
+        matching a sub-string already captured by 'AWS Certified ...'.
+        Fix: normalise each match to a dedup key and prefer longer matches.
+        Also uses [a-zA-Z ] (no newline) in trailing captures to prevent
+        cross-line matching that appended the next line's first word.
+        """
         cert_text = sections.get("certifications", "")
-        # Also look in the full text for known cert patterns
         combined = cert_text + "\n" + text
+
+        # Use [a-zA-Z ] (no newline) in trailing captures to prevent
+        # the regex engine from matching across line boundaries.
         patterns = [
-            r"AWS\s+(?:Certified\s+)?[A-Z][a-zA-Z\s]{3,40}",
-            r"Google\s+(?:Cloud\s+)?(?:Certified\s+)?[A-Z][a-zA-Z\s]{3,30}",
-            r"Microsoft\s+(?:Certified\s+)?[A-Z][a-zA-Z:\s]{3,40}",
+            r"AWS\s+Certified\s+[A-Z][a-zA-Z ]{3,40}",
+            r"Google\s+(?:Cloud\s+)?(?:Certified\s+)?[A-Z][a-zA-Z ]{3,30}",
+            r"Microsoft\s+(?:Certified\s+)?[A-Z][a-zA-Z: ]{3,40}",
             r"(?:PMP|CISSP|CPA|CISA|CEH|OSCP|CCNA|CCNP|CKA|GCP|Azure)\b",
-            r"(?:Certified\s+[A-Z][a-zA-Z\s]{3,30})",
+            r"Certified\s+[A-Z][a-zA-Z ]{3,30}",
         ]
-        found = set()
+
+        # key → longest match seen so far
+        seen: Dict[str, str] = {}
+
         for p in patterns:
             for m in re.finditer(p, combined):
-                cert = m.group(0).strip()
-                if len(cert) > 3:
-                    found.add(cert)
-        return sorted(found)[:10]
+                cert = re.sub(r"\s+", " ", m.group(0).strip())
+                if len(cert) <= 3:
+                    continue
+
+                key = _cert_key(cert)
+
+                # Check if this key is a sub-string of an already-seen key
+                # (i.e. a more-specific match is already stored)
+                already_covered = any(key in existing_key for existing_key in seen)
+                if already_covered:
+                    continue
+
+                # Check if this new match covers a previously stored shorter key
+                for existing_key in list(seen.keys()):
+                    if existing_key in key:
+                        del seen[existing_key]
+
+                seen[key] = cert
+
+        return sorted(seen.values())[:10]
 
     def _extract_languages(self, text: str) -> List[str]:
-        """Extract spoken/written languages (not programming languages)."""
         human_langs = [
             "english", "spanish", "french", "german", "mandarin", "chinese",
             "japanese", "arabic", "hindi", "portuguese", "russian", "korean",
             "italian", "dutch", "tamil", "telugu", "kannada",
         ]
-        text_lower = text.lower()
-        found = []
-        # Only look in sections that mention languages explicitly
         lang_section = re.search(
             r"(?:languages?|linguistic)[:\s]+(.{0,200})", text, re.IGNORECASE
         )
-        search_text = lang_section.group(1).lower() if lang_section else text_lower
+        search_text = (
+            lang_section.group(1).lower() if lang_section else text.lower()
+        )
+        found = []
         for lang in human_langs:
             if re.search(r"\b" + lang + r"\b", search_text):
                 found.append(lang.title())
         return found
 
     def _extract_summary(self, text: str, sections: Dict[str, str]) -> str:
-        """Extract the professional summary/objective."""
-        # Try dedicated section first
         if "summary" in sections and sections["summary"].strip():
-            raw = sections["summary"].strip()
-            return " ".join(raw.split())[:400]
-
-        # Fallback: first substantial paragraph
+            return " ".join(sections["summary"].strip().split())[:400]
         paragraphs = [p.strip() for p in re.split(r"\n\n+", text) if len(p.strip()) > 80]
         if paragraphs:
             return " ".join(paragraphs[0].split())[:400]
         return ""
 
     def _calculate_confidence(self, c: Candidate) -> float:
-        """
-        Heuristic parse confidence score (0–1).
-        Checks how many key fields were successfully extracted.
-        """
-        score = 0.0
         checks = [
-            (c.name != "Unknown", 0.20),
-            (bool(c.email), 0.20),
-            (bool(c.skills), 0.20),
-            (c.experience_years > 0, 0.15),
+            (c.name != "Unknown",                  0.20),
+            (bool(c.email),                        0.20),
+            (bool(c.skills),                       0.20),
+            (c.experience_years > 0,               0.15),
             (c.education != EducationLevel.UNKNOWN, 0.15),
-            (bool(c.summary), 0.10),
+            (bool(c.summary),                      0.10),
         ]
-        for condition, weight in checks:
-            if condition:
-                score += weight
-        return round(score, 2)
+        return round(sum(w for cond, w in checks if cond), 2)
