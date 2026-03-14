@@ -281,11 +281,18 @@ Raw Resume Text
 
 ## 📄 License
 
-MIT License — free to use, modify, and distribute.
+Copyright (c) 2026 Nithin Bharadwaj
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software.
 
 ---
 
 ## 👤 Author
+Nithin Bharadwaj
 
-Built as a demonstration of production Python engineering practices:
-clean architecture, separation of concerns, type safety, comprehensive testing, and zero external dependencies.
+Capstone Project: Intelligent Resume Analyzer  
+Demonstrates resume parsing, skill matching, and candidate recommendation using Python.
